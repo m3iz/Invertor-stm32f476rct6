@@ -36,7 +36,7 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define RX_BUFFER_SIZE 64  // Задайте нужный размер буфера
+#define RX_BUFFER_SIZE 1024  // Задайте нужный размер буфера
 
 /* USER CODE END PM */
 
@@ -44,16 +44,21 @@
 TIM_HandleTypeDef htim1;
 
 UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart3_rx;
 
 /* USER CODE BEGIN PV */
-uint8_t rx_buffer[RX_BUFFER_SIZE];  // Буфер для приема данных
-uint8_t rx_data;  // Переменная для приема байта данных по прерыванию
-uint16_t rx_index = 0;  // �?ндекс для отслеживания положения в буфере
+
+volatile uint16_t commandLength = 0;  // Текущая длина команды
+uint8_t commandBuffer[RX_BUFFER_SIZE];  // Буфер для команды
+uint8_t rxBuffer[RX_BUFFER_SIZE];  // Буфер для приема данных через DMA
+uint16_t rx_index = 0;  // индекс для отслеживания положения в буфере
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
@@ -66,9 +71,6 @@ static void MX_USART3_UART_Init(void);
 void SetPWMFrequency(TIM_HandleTypeDef *htim, uint32_t frequency) {
 
 	int timerClock = HAL_RCC_GetPCLK2Freq();
-	int temp = htim->Init.Prescaler + 1;
-	int result = timerClock / temp;
-	//result = result/100 - 1;
 	int period = ((HAL_RCC_GetPCLK2Freq() / (htim->Init.Prescaler + 1))
 			/ frequency) - 1;
 
@@ -84,64 +86,58 @@ void SetPWMDutyCycle(TIM_HandleTypeDef *htim, uint32_t dutyCycle) {
 	__HAL_TIM_SET_COMPARE(htim, TIM_CHANNEL_3, pulse);
 }
 
-void ParseCommand() {
+void UART_DMA_Init(void) {
+	// Запуск DMA на прием данных
+	HAL_UART_Receive_DMA(&huart3, rxBuffer, RX_BUFFER_SIZE);
+	// Включение прерывания IDLE для UART
+	__HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
+}
+
+void ProcessCommand(uint8_t *command, uint16_t length) {
+	// Функция обработки команды, завершенной символом ';'
 	uint32_t frequency = 0;
 	uint32_t dutyCycle = 0;
 
 	// Парсинг данных (пример для простоты)
-	sscanf((char*) rx_buffer, "FREQ:%lu;DUTY:%lu;", &frequency, &dutyCycle);
+	sscanf((char*) command, "F:%lu,D:%lu;", &frequency, &dutyCycle);
 
 	// Обновление параметров таймера
 	SetPWMFrequency(&htim1, frequency);
 	SetPWMDutyCycle(&htim1, dutyCycle);
+	//printf("Received command: %.*s\n", length, command);
+	HAL_UART_Transmit(&huart3, command, length, 1000);
+	// Здесь может быть дополнительная логика обработки команды
 }
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-	if (huart == &huart3) {
+void UART_IDLE_Callback(void) {
+	// Определение количества принятых байт в буфере DMA
+	uint16_t bytesReceived = RX_BUFFER_SIZE
+			- __HAL_DMA_GET_COUNTER(huart3.hdmarx);
 
-		if (rx_data == ';')  // Если получен символ конца строки
-				{
-			rx_buffer[rx_index + 1] = '\0';  // Завершаем строку
-			ParseCommand();  // Обработка команды из rx_buffer
-			rx_index = 0;  // Сброс индекса для нового приема
-		} else {
-			// Записываем байт в буфер и увеличиваем индекс
-			rx_buffer[rx_index++] = rx_data;
+	// Копирование новых данных из rxBuffer в commandBuffer, начиная с текущей позиции
+	for (uint16_t i = rx_index; i < bytesReceived; i++) {
+		uint8_t byte = rxBuffer[i];
 
-			// Проверка на переполнение
-			if (rx_index >= RX_BUFFER_SIZE) {
-				rx_index = 0;  // Сброс буфера в случае переполнения
-			}
+		// Копирование байта в командный буфер
+		if (commandLength < RX_BUFFER_SIZE - 1) {
+			commandBuffer[commandLength++] = byte;
 		}
-		HAL_UART_Transmit(&huart3, rx_buffer, sizeof(rx_buffer), 1000);
-		HAL_UART_Receive_IT(&huart3, rx_buffer, 1);
+
+		// Если байт - это ';', то обработать команду
+		if (byte == ';') {
+			ProcessCommand(commandBuffer, commandLength); // Вызываем обработку команды
+			commandLength = 0;  // Сброс длины команды для новой команды
+			memset(commandBuffer, 0, RX_BUFFER_SIZE);  // Очистка буфера команды
+			break; // Прекращаем проверку оставшихся данных, если команда завершена
+		}
 	}
+
+	// Сохранение текущей позиции в буфере для следующего прерывания
+	rx_index = bytesReceived;
+
+	// Перезапуск DMA для приема новых данных
+	HAL_UART_Receive_DMA(&huart3, rxBuffer, RX_BUFFER_SIZE);
 }
-
-/*void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
- HAL_UART_Transmit(&huart3, "hello", sizeof("hello"), 1000);
- if (huart == &huart3)  // Проверка, что прерывание от нужного UART
- {
- if (rx_data == ';')  // Если получен символ конца строки
- {
- rx_buffer[rx_index + 1] = '\0';  // Завершаем строку
- ParseCommand();  // Обработка команды из rx_buffer
- rx_index = 0;  // Сброс индекса для нового приема
- } else {
- // Записываем байт в буфер и увеличиваем индекс
- rx_buffer[rx_index++] = rx_data;
-
- // Проверка на переполнение
- if (rx_index >= RX_BUFFER_SIZE) {
- rx_index = 0;  // Сброс буфера в случае переполнения
- }
- }
-
- // Перезапуск приема следующего байта
- HAL_UART_Receive_IT(&huart3, &rx_data, 1);
- }
- }
- */
 /* USER CODE END 0 */
 
 /**
@@ -171,11 +167,12 @@ int main(void) {
 
 	/* Initialize all configured peripherals */
 	MX_GPIO_Init();
+	MX_DMA_Init();
 	MX_TIM1_Init();
 	MX_USART3_UART_Init();
 	/* USER CODE BEGIN 2 */
-	HAL_UART_Receive_IT(&huart3, rx_buffer, 1); // Прием строки фиксированной длины
-
+	//HAL_UART_Receive_IT(&huart3, rx_buffer, 1); // Прием строки фиксированной длины
+	UART_DMA_Init();
 	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
 	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
 	SetPWMFrequency(&htim1, 100);
@@ -337,6 +334,21 @@ static void MX_USART3_UART_Init(void) {
 	/* USER CODE BEGIN USART3_Init 2 */
 
 	/* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+ * Enable DMA controller clock
+ */
+static void MX_DMA_Init(void) {
+
+	/* DMA controller clock enable */
+	__HAL_RCC_DMA1_CLK_ENABLE();
+
+	/* DMA interrupt init */
+	/* DMA1_Channel3_IRQn interrupt configuration */
+	HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
+	HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
 
 }
 
